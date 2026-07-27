@@ -26,7 +26,6 @@ from .const import (
     DOMAIN,
     IDLE_DISCONNECT_SECONDS,
     NOTIFY_CHAR_UUID,
-    RECONNECT_INTERVAL_SECONDS,
     WAKE_PAYLOAD,
     WRITE_CHAR_UUID,
 )
@@ -45,7 +44,16 @@ async def async_setup_entry(
 
 
 class BLEScaleSensor(SensorEntity):
-    """Representation of a BLE Scale weight reading."""
+    """Representation of a BLE Scale weight reading.
+
+    Connection model is purely advertisement-driven: a BLE body scale sleeps
+    between weigh-ins and is only connectable for a few seconds while in use.
+    We therefore connect ONLY when the scale advertises (i.e. someone stepped
+    on it), read the weight, then disconnect shortly after the last reading.
+    We never poll, and never retry-loop against a sleeping scale — doing so
+    would permanently occupy a connection slot on the (often shared) BLE proxy
+    and starve other devices, while never succeeding until the next weigh-in.
+    """
 
     _attr_has_entity_name = True
     _attr_name = "Weight"
@@ -67,7 +75,6 @@ class BLEScaleSensor(SensorEntity):
         self._client: BleakClient | None = None
         self._connect_lock = asyncio.Lock()
         self._disconnect_handle: asyncio.TimerHandle | None = None
-        self._retry_task: asyncio.Task[None] | None = None
         self._unavailable_cancel: Any = None
         self._available = False
 
@@ -77,7 +84,13 @@ class BLEScaleSensor(SensorEntity):
         return self._available
 
     async def async_added_to_hass(self) -> None:
-        """Register callbacks and try to connect when added."""
+        """Register advertisement callbacks.
+
+        We do NOT attempt a connection here: at startup the scale is almost
+        always asleep and not connectable. The advertisement callback fires
+        when it wakes (a weigh-in) and that is the only time a connection can
+        succeed, so it is the sole connection trigger.
+        """
         self._unavailable_cancel = bluetooth.async_track_unavailable(
             self.hass, self._handle_unavailable, self._address, connectable=True
         )
@@ -89,15 +102,12 @@ class BLEScaleSensor(SensorEntity):
                 bluetooth.BluetoothScanningMode.ACTIVE,
             )
         )
-        self.hass.async_create_task(self._async_connect())
 
     async def async_will_remove_from_hass(self) -> None:
         """Tear down connection state when entity is removed."""
         if self._unavailable_cancel is not None:
             self._unavailable_cancel()
             self._unavailable_cancel = None
-        if self._retry_task and not self._retry_task.done():
-            self._retry_task.cancel()
         if self._disconnect_handle is not None:
             self._disconnect_handle.cancel()
             self._disconnect_handle = None
@@ -144,7 +154,7 @@ class BLEScaleSensor(SensorEntity):
 
     @callback
     def _reset_idle_disconnect(self) -> None:
-        """(Re)arm the idle disconnect timer."""
+        """(Re)arm the idle disconnect timer to release the slot promptly."""
         if self._disconnect_handle is not None:
             self._disconnect_handle.cancel()
         self._disconnect_handle = self.hass.loop.call_later(
@@ -154,7 +164,13 @@ class BLEScaleSensor(SensorEntity):
 
     @callback
     def _handle_client_disconnect(self, _client: BleakClient) -> None:
-        """Bleak disconnected callback — flag unavailable, drop client."""
+        """Bleak disconnected callback.
+
+        An unsolicited drop is normal: the scale powers down a few seconds
+        after a weigh-in. We simply release our reference and wait for the
+        next advertisement — we do NOT retry, which would hammer a sleeping
+        device and hog the proxy slot.
+        """
         self._client = None
         self._available = False
         self.async_write_ha_state()
@@ -169,8 +185,9 @@ class BLEScaleSensor(SensorEntity):
                 self.hass, self._address, connectable=True
             )
             if ble_device is None:
-                _LOGGER.debug("Scale %s not currently visible", self._address)
-                self._schedule_retry()
+                # Asleep / not currently connectable — normal between weigh-ins.
+                # Wait for the next advertisement rather than retry-looping.
+                _LOGGER.debug("Scale %s not connectable right now", self._address)
                 return
 
             try:
@@ -179,16 +196,18 @@ class BLEScaleSensor(SensorEntity):
                     ble_device,
                     self._address,
                     disconnected_callback=self._handle_client_disconnect,
+                    max_attempts=2,
                 )
                 await client.start_notify(NOTIFY_CHAR_UUID, self._notification_handler)
                 await client.write_gatt_char(
                     WRITE_CHAR_UUID, WAKE_PAYLOAD, response=False
                 )
             except (BleakError, asyncio.TimeoutError, TimeoutError) as err:
-                _LOGGER.warning("Failed to connect to %s: %s", self._address, err)
+                # Expected when the scale drops mid-handshake as it powers off.
+                # The next advertisement will re-trigger a connect; no retry loop.
+                _LOGGER.debug("Connect to %s did not complete: %s", self._address, err)
                 self._available = False
                 self.async_write_ha_state()
-                self._schedule_retry()
                 return
 
             self._client = client
@@ -197,7 +216,7 @@ class BLEScaleSensor(SensorEntity):
             self._reset_idle_disconnect()
 
     async def _async_disconnect(self) -> None:
-        """Drop the BLE connection if held."""
+        """Drop the BLE connection if held, releasing the proxy slot."""
         client = self._client
         self._client = None
         if self._disconnect_handle is not None:
@@ -209,18 +228,3 @@ class BLEScaleSensor(SensorEntity):
             await client.disconnect()
         except BleakError as err:
             _LOGGER.debug("Error disconnecting from %s: %s", self._address, err)
-
-    @callback
-    def _schedule_retry(self) -> None:
-        """Schedule a connection retry after a delay."""
-        if self._retry_task and not self._retry_task.done():
-            return
-        self._retry_task = self.hass.async_create_task(self._async_retry())
-
-    async def _async_retry(self) -> None:
-        """Sleep then try to connect again."""
-        try:
-            await asyncio.sleep(RECONNECT_INTERVAL_SECONDS)
-        except asyncio.CancelledError:
-            return
-        await self._async_connect()
